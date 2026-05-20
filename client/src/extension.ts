@@ -70,6 +70,54 @@ async function activateClient(context: vscode.ExtensionContext) {
         }
     }
 
+    async function checkProxyError(params: StatusParams) {
+        const configuration = getDeepScanConfiguration();
+        const useProxy = configuration.get('proxy') || process.env.HTTPS_PROXY || process.env.HTTP_PROXY ||
+            process.env.https_proxy || process.env.http_proxy;
+        const message = params.message || '';
+        const isCertificateError = message.toLowerCase().includes('certificate');
+        if (!useProxy) {
+            if (isCertificateError) {
+                client.error(`Failed to inspect: ${message}`);
+            }
+            return;
+        }
+        if (!isCertificateError) {
+            return;
+        }
+
+        let warningMessage: string;
+        let consoleMessage = message.trim().endsWith('.') ? message : `${message.trim()}.`;
+        const useCustomCertificate = !!process.env.NODE_EXTRA_CA_CERTS;
+        if (!useCustomCertificate) {
+            if (!isMissingCertEnvWarningDisabled) {
+                warningMessage = "DeepScan inspection failed. If you are behind a proxy requiring custom certificate, set NODE_EXTRA_CA_CERTS environment variable and restart VS Code.";
+                isMissingCertEnvWarningDisabled = true;
+            }
+            consoleMessage = `Failed to inspect: ${consoleMessage} Consider setting NODE_EXTRA_CA_CERTS environment variable.`;
+            client.error(consoleMessage);
+        }
+        if (useCustomCertificate) {
+            const [major, minor] = vscode.version.split('.').map(Number);
+            const isSupportedVersion = major > 1 || (major === 1 && minor >= 92);
+
+            if (!isSupportedVersion) {
+                if (!isOutdatedVscodeCertWarningDisabled) {
+                    warningMessage = "A certificate error occurred during DeepScan inspection. Consider updating VS Code to 1.92 or above that supports NODE_EXTRA_CA_CERTS environment variable.";
+                    isOutdatedVscodeCertWarningDisabled = true;
+                }
+                consoleMessage = `Failed to inspect: ${consoleMessage} Consider updating VS Code to 1.92 or above for NODE_EXTRA_CA_CERTS support.`;
+                client.error(consoleMessage);
+            } else {
+                client.error(`Failed to inspect: ${message}`);
+            }
+        }
+        if (warningMessage) {
+            const dismiss = 'Dismiss';
+            await vscode.window.showErrorMessage(warningMessage, dismiss);
+        }
+    }
+
     function updateStatus(status: Status) {
         statusBar.update(status);
         updateStatusBar(vscode.window.activeTextEditor);
@@ -128,7 +176,13 @@ async function activateClient(context: vscode.ExtensionContext) {
                           isConfigurationChanged('serverEmbedded.serverJar', oldConfig, newConfig);
         const isChangedIgnoreConfig = isConfigurationChanged('ignoreRules', oldConfig, newConfig) ||
                           isConfigurationChanged('ignorePatterns', oldConfig, newConfig);
+        const isServerOrProxyChanged = isConfigurationChanged('server', oldConfig, newConfig) ||
+                        isConfigurationChanged('proxy', oldConfig, newConfig);
 
+        if (isServerOrProxyChanged) {
+            isMissingCertEnvWarningDisabled = false;
+            isOutdatedVscodeCertWarningDisabled = false;
+        }
         // NOTE:
         // To apply changed file suffixes directly, documentSelector of LanguageClient should be changed.
         // But it seems to be impossible, so VS Code needs to restart.
@@ -140,6 +194,7 @@ async function activateClient(context: vscode.ExtensionContext) {
                 vscode.commands.executeCommand('workbench.action.reloadWindow');
             }
         }
+
     }
 
     function getFileSuffixes(configuration: vscode.WorkspaceConfiguration): string[] {
@@ -176,6 +231,8 @@ async function activateClient(context: vscode.ExtensionContext) {
     let staticDocumentsForDisablingRules: DocumentSelector = _.filter(staticDocuments, ({ pattern }) => pattern !== '**/*.vue');
 
     let activeDecorations;
+    let isMissingCertEnvWarningDisabled = false;
+    let isOutdatedVscodeCertWarningDisabled = false;
 
     const deepscanToken = new DeepscanToken(context);
     const token = await deepscanToken.getToken();
@@ -190,6 +247,7 @@ async function activateClient(context: vscode.ExtensionContext) {
         initializationOptions: () => {
             return {
                 server: getServerUrl(),
+                proxy: configuration.get('proxy'),
                 token,
                 DEFAULT_FILE_SUFFIXES,
                 fileSuffixes: getFileSuffixes(configuration),
@@ -252,6 +310,8 @@ async function activateClient(context: vscode.ExtensionContext) {
             activeDecorations.updateDecorations(uri);
             if (state === Status.INVALID_TOKEN || state == Status.EXPIRED_TOKEN || state === Status.SUSPENDED_TOKEN) {
                 handleTokenNotification(params);
+            } else if (state === Status.fail) {
+                checkProxyError(params);
             }
         });
 

@@ -6,6 +6,8 @@
 
 import * as _ from 'lodash';
 import ignore from 'ignore';
+import { getProxyForUrl } from 'proxy-from-env';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 import {
     createConnection, IConnection,
@@ -19,6 +21,38 @@ import { URL } from 'url';
 const path = require('path');
 const axios = require('axios').default;
 const FormData = require('form-data');
+
+let cachedHttpsAgent: HttpsProxyAgent<string> | null = null;
+
+function getHttpsProxyAgent(proxyUrl: string): HttpsProxyAgent<string> {
+    if (cachedHttpsAgent) {
+        return cachedHttpsAgent;
+    }
+    cachedHttpsAgent = new HttpsProxyAgent(proxyUrl);
+    return cachedHttpsAgent;
+}
+
+function getAxiosConfig(targetUrl: string, extraHeaders: any = {}) {
+    const config: any = {
+        headers: {
+            "Authorization": `Bearer ${token}`,
+            "user-agent": userAgent,
+            ...extraHeaders
+        }
+    };
+    if (proxyServer) {
+        const parsedTargetUrl = new URL(targetUrl);
+        if (parsedTargetUrl.protocol === 'https:') {
+            config.proxy = false;
+            config.httpsAgent = getHttpsProxyAgent(proxyServer);
+        } else {
+            config.proxy = parseProxy(proxyServer);
+        }
+    } else {
+        config.proxy = false;
+    }
+    return config;
+}
 
 enum Status {
     none = 0,
@@ -142,7 +176,7 @@ connection.onInitialize((params) => {
         userAgent: string;
     } = params.initializationOptions;
     deepscanServer = getServerUrl(initOptions.server);
-    proxyServer = initOptions.proxy;
+    proxyServer = initOptions.proxy || getProxyForUrl(deepscanServer);
     token = initOptions.token;
 
     DEFAULT_FILE_SUFFIXES = initOptions.DEFAULT_FILE_SUFFIXES;
@@ -176,8 +210,10 @@ connection.onDidChangeConfiguration((params) => {
         changed = true;
     }
 
-    if (!_.isEqual(proxyServer, settings.deepscan.proxy)) {
-        proxyServer = settings.deepscan.proxy;
+    const newProxyServer = settings.deepscan.proxy || getProxyForUrl(deepscanServer);
+    if (!_.isEqual(proxyServer, newProxyServer)) {
+        proxyServer = newProxyServer;
+        cachedHttpsAgent = null;
         changed = true;
     }
 
@@ -202,13 +238,7 @@ connection.onRequest('deepscan.getTokenInfo', async () => {
         const apiPath = `${deepscanServer}/api/vscode/tokeninfo`;
         const response = await axios.post(apiPath,
             { date: Date.now() }, // Dummy payload for ensuring a "Content-Type" field
-            {
-                proxy: parseProxy(proxyServer),
-                headers: {
-                    "Authorization": `Bearer ${token}`,
-                    "user-agent": userAgent
-                },
-            }
+            getAxiosConfig(apiPath)
         );
         return response.data.data;
     } catch (err) {
@@ -346,14 +376,7 @@ async function inspect(identifier: VersionedTextDocumentIdentifier) {
             filename,
             contentType: "text/plain",
         });
-        const response = await axios.post(URL, form, {
-            proxy: parseProxy(proxyServer),
-            headers: {
-                "Authorization": `Bearer ${token}`,
-                "user-agent": userAgent,
-                ...form.getHeaders(),
-            },
-        });
+        const response = await axios.post(URL, form, getAxiosConfig(URL, form.getHeaders()));
         let diagnostics: Diagnostic[] = getResult(response.data.data);
 
         if (Array.isArray(settings.deepscan.ignoreRules)) {
@@ -385,7 +408,9 @@ async function inspect(identifier: VersionedTextDocumentIdentifier) {
             state = Status.SUSPENDED_TOKEN;
             message = `DeepScan access token was suspended. Visit ${deepscanServer} to check your plan in the team settings page.`;
         }
-        connection.console.error(`Failed to inspect: ${message}`);
+        if (!message.toLowerCase().includes('certificate')) {
+            connection.console.error(`Failed to inspect: ${message}`);
+        }
         connection.sendNotification(StatusNotification.type, {
             state,
             message,
