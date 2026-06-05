@@ -59,6 +59,7 @@ enum Status {
     ok = 1,
     warn = 2,
     fail = 3,
+    limit_exceeded = 4,
 
     EMPTY_TOKEN = 10,
     INVALID_TOKEN = 11,
@@ -131,6 +132,45 @@ let ignorePatterns: string[] = null;
 let DEFAULT_FILE_SUFFIXES: string[] = null;
 let fileSuffixes: string[] = null;
 
+let requestCount: number = 0;
+let windowStart: number = Date.now();
+let hasLoggedErrorInCurrentWindow: boolean = false;
+const DEEPSCAN_WINDOW_SIZE_MS: number = 60 * 1000;
+const DEEPSCAN_MAX_REQUESTS: number = 45;
+
+let trackedDocuments: Set<string> = new Set<string>();
+let untrackedSkipCounter: number = 0;
+let untrackedSkipWindowStart: number = Date.now();
+
+function checkTrackedDocument(uri: string): boolean {
+    const now = Date.now();
+    if (now - untrackedSkipWindowStart >= 1000) {
+        untrackedSkipWindowStart = now;
+        untrackedSkipCounter = 0;
+    }
+
+    if (untrackedSkipCounter < 2) {
+        untrackedSkipCounter++;
+        trackedDocuments.add(uri);
+        return true;
+    }
+    return trackedDocuments.has(uri);
+}
+
+function checkRateLimit(): boolean {
+    const now = Date.now();
+    if (now - windowStart >= DEEPSCAN_WINDOW_SIZE_MS) {
+        windowStart = now;
+        requestCount = 0;
+        hasLoggedErrorInCurrentWindow = false;
+    }
+    if (requestCount >= DEEPSCAN_MAX_REQUESTS) {
+        return false;
+    }
+    requestCount++;
+    return true;
+}
+
 function supportsLanguage(document: TextDocument): boolean {
     return _.includes(supportedFileSuffixes, path.extname(document.uri));
 }
@@ -138,23 +178,40 @@ function supportsLanguage(document: TextDocument): boolean {
 // The documents manager listen for text document create, change
 // and close on the connection
 documents.listen(connection);
+
+connection.onNotification('deepscan/trackDocument', (params: { uri: string }) => {
+    const isNewDocument = !trackedDocuments.has(params.uri);
+    if (!isNewDocument) {
+        return;
+    }
+    trackedDocuments.add(params.uri);
+    const textDocument = documents.get(params.uri);
+    if (textDocument && supportsLanguage(textDocument)) {
+        inspect(textDocument, false);
+    }
+});
+
 documents.onDidOpen((event) => {
     if (!supportsLanguage(event.document)) {
         return;
     }
-
-    inspect(event.document);
+    const isDuplicateInspection = trackedDocuments.has(event.document.uri);
+    inspect(event.document, isDuplicateInspection);
 });
 
 // A text document has been saved. Validate the document according the run setting.
 documents.onDidSave((event) => {
-    inspect(event.document);
+    if (!supportsLanguage(event.document)) {
+        return;
+    }
+    inspect(event.document, false);
 });
 
 documents.onDidClose((event) => {
     if (!supportsLanguage(event.document)) {
         return;
     }
+    trackedDocuments.delete(event.document.uri);
     connection.sendDiagnostics({ uri: event.document.uri, diagnostics: [] });
 });
 
@@ -309,19 +366,42 @@ function parseProxy(proxyUrl) {
     return proxySetting;
 }
 
-async function inspect(identifier: VersionedTextDocumentIdentifier) {
+function sendLimitExceededNotification() {
+    const message = 'Failed to inspect: Too many requests, please try again later.';
+    hasLoggedErrorInCurrentWindow = true;
+    connection.console.error(message);
+    connection.sendNotification(StatusNotification.type, {
+        state: Status.limit_exceeded,
+        message,
+        uri: null,
+    });
+}
+
+async function inspect(identifier: VersionedTextDocumentIdentifier, isDuplicateInspection: boolean = false) {
     const guideUrl = `${deepscanServer}/docs/deepscan/vscode#token`;
     const generateUrl = `${deepscanServer}/dashboard/#view=account-settings`;
 
     let uri = identifier.uri;
     let textDocument = documents.get(uri);
+    if (!textDocument) {
+        return;
+    }
+
     let docContent = textDocument.getText();
+    if (docContent.trim() === '') {
+        sendDiagnostics([]);
+        return;
+    }
 
     const URL = `${deepscanServer}/api/vscode/analysis`;
     const MAX_LINES = 10000;
     const MAX_CHARS = 500000;
 
     function sendDiagnostics(diagnostics) {
+        if (!trackedDocuments.has(uri)) {
+            connection.sendDiagnostics({ uri: uri, diagnostics: [] });
+            return;
+        }
         connection.sendDiagnostics({ uri: textDocument.uri, diagnostics });
     }
 
@@ -334,11 +414,6 @@ async function inspect(identifier: VersionedTextDocumentIdentifier) {
             message,
             uri: null,
         });
-        return;
-    }
-
-    if (docContent.trim() === '') {
-        sendDiagnostics([]);
         return;
     }
 
@@ -362,13 +437,24 @@ async function inspect(identifier: VersionedTextDocumentIdentifier) {
         return;
     }
 
+    if (!checkTrackedDocument(uri)) {
+        return;
+    }
+    if (!checkRateLimit()) {
+        if (!hasLoggedErrorInCurrentWindow) {
+            sendLimitExceededNotification();
+        }
+        return;
+    }
+
     // Send filename with extension to parse correctly in server.
     let fileSuffix = path.extname(uri);
     // The file with a suffix in 'fileSuffixes' will be transmitted as a '.js' file.
     if (fileSuffixes.indexOf(fileSuffix) !== -1) {
         fileSuffix = ".js";
     }
-    let filename = `demo${fileSuffix}`;
+
+    const filename = isDuplicateInspection ? `demo2${fileSuffix}` : `demo${fileSuffix}`;
 
     try {
         const form = new FormData();
@@ -394,9 +480,15 @@ async function inspect(identifier: VersionedTextDocumentIdentifier) {
         });
     } catch (err) {
         let message = err?.response?.data?.reason || err.message;
+        let state: Status = Status.fail;
+        if (message.includes('Too many requests')) {
+            if (!hasLoggedErrorInCurrentWindow) {
+                sendLimitExceededNotification();
+            }
+            return;
+        }
         // Clear problems
         sendDiagnostics([]);
-        let state: Status = Status.fail;
         const isTokenMessage = message.includes('token');
         if (isTokenMessage && message.includes('expired')) {
             state = Status.EXPIRED_TOKEN;

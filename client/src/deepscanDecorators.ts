@@ -9,7 +9,7 @@ import * as _ from 'lodash';
 import { window, workspace, DecorationRenderOptions, Disposable, Range, TextEditor } from 'vscode';
 import { LanguageClient } from 'vscode-languageclient';
 
-import { DiagnosticSeverity, Suggestion } from './types';
+import { DiagnosticSeverity, Suggestion, Status } from './types';
 
 const decorationType: DecorationRenderOptions = {
     isWholeLine: true,
@@ -33,14 +33,16 @@ export function activateDecorations(client: LanguageClient) {
 
     let showDecorators = workspace.getConfiguration('deepscan').get('showDecorators');
     let timeout = null;
+    let status: Status;
 
     let activeEditor = window.activeTextEditor;
 
     window.onDidChangeActiveTextEditor(editor => {
         activeEditor = editor;
-        if (editor) {
-            triggerReviveDecorations();
+        if (!editor || editor.document.isDirty) {
+            return;
         }
+        triggerReviveDecorations();
     }, null, disposables);
 
     workspace.onDidChangeConfiguration(() => {
@@ -70,7 +72,8 @@ export function activateDecorations(client: LanguageClient) {
         });
     }
 
-    function updateDecorations(uri: string) {
+    function updateDecorations(uri: string, state: Status) {
+        status = state;
         window.visibleTextEditors.forEach(editor => {
             if (editor.document && uri === editor.document.uri.toString()) {
                 updateDecorationForEditor(editor, client.diagnostics.get(editor.document.uri));
@@ -79,7 +82,7 @@ export function activateDecorations(client: LanguageClient) {
     }
 
     function updateDecorationForEditor(editor: TextEditor, diagnostics) {
-        if (!showDecorators) {
+        if (!showDecorators || status === Status.limit_exceeded) {
             clearDecorations(editor.document.uri.toString());
             return;
         }
